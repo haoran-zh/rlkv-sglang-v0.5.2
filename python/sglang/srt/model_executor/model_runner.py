@@ -364,6 +364,11 @@ class ModelRunner:
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
 
+        if self.server_args.enable_mixed_attention and self.server_args.enable_semantic_kv:
+            raise ValueError(
+                "enable_mixed_attention and enable_semantic_kv are mutually exclusive."
+            )
+
         # enable mixed_attention forward
         # add by Wenjie
         if self.server_args.enable_mixed_attention:
@@ -446,6 +451,62 @@ class ModelRunner:
 
                 # Register the adapter layer as a submodule
                 module.add_module("adapter", adapter)
+        elif self.server_args.enable_semantic_kv:
+            from sglang.srt.model_executor.monkey_forward import SemanticKVProjectionLayer
+
+            semantic_kv_weights = None
+            semantic_kv_load_path = self.server_args.semantic_kv_load_path
+
+            if semantic_kv_load_path is not None:
+                if os.path.isdir(semantic_kv_load_path):
+                    semantic_kv_load_path = os.path.join(
+                        semantic_kv_load_path, "semantic_kv.pt"
+                    )
+                if os.path.exists(semantic_kv_load_path):
+                    logger.info(
+                        "Loading semantic-KV weights from %s", semantic_kv_load_path
+                    )
+                    checkpoint = torch.load(semantic_kv_load_path, map_location="cpu")
+                    semantic_kv_weights = checkpoint.get("projection_weight_dict", None)
+                    if semantic_kv_weights is None:
+                        raise ValueError(
+                            f"Invalid semantic-KV checkpoint: {semantic_kv_load_path}"
+                        )
+                else:
+                    raise ValueError(
+                        f"Semantic-KV weights path {semantic_kv_load_path} does not exist."
+                    )
+
+            for layer_id, layer in enumerate(self.model.model.layers):
+                module = layer.self_attn
+                semantic_kv = SemanticKVProjectionLayer(
+                    low_rank_dim=self.server_args.semantic_kv_rank,
+                    head_dim=module.head_dim,
+                    params_dtype=self.dtype,
+                ).to(self.device)
+
+                if semantic_kv_weights is not None:
+                    layer_key = layer_id if layer_id in semantic_kv_weights else str(layer_id)
+                    if layer_key not in semantic_kv_weights:
+                        raise ValueError(
+                            f"Semantic-KV weights for layer {layer_id} not found in "
+                            f"the provided path: {semantic_kv_load_path}"
+                        )
+                    full_weight = semantic_kv_weights[layer_key]
+                    if full_weight.shape != semantic_kv.weight.shape:
+                        raise ValueError(
+                            f"Semantic-KV weight shape mismatch for layer {layer_id}: "
+                            f"expected {semantic_kv.weight.shape}, got {full_weight.shape}"
+                        )
+                    with torch.no_grad():
+                        semantic_kv.weight.copy_(full_weight.to(self.device))
+
+                module.add_module("semantic_kv", semantic_kv)
+
+            logger.warning(
+                "Semantic-KV modules are registered for weight sync/checkpointing, "
+                "but the rollout-time compressed attention backend is still TODO."
+            )
 
         # Init lora
         if server_args.enable_lora:

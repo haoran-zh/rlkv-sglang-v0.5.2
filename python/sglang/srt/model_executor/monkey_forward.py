@@ -119,6 +119,29 @@ class HeadAdapterLayer(nn.Module):
         return s
 
 
+class SemanticKVProjectionLayer(nn.Module):
+    """Replicated low-rank projector used for semantic-KV experiments.
+
+    The weight is intentionally replicated across tensor-parallel ranks because it is
+    lightweight and the rollout-side compressed attention path is still TODO.
+    """
+
+    def __init__(
+        self,
+        low_rank_dim: int,
+        head_dim: int,
+        params_dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__()
+        self.low_rank_dim = low_rank_dim
+        self.head_dim = head_dim
+        self.weight = Parameter(torch.empty(low_rank_dim, head_dim, dtype=params_dtype))
+        nn.init.orthogonal_(self.weight)
+
+    def extra_repr(self) -> str:
+        return f"low_rank_dim={self.low_rank_dim}, head_dim={self.head_dim}"
+
+
 def monkey_forward(
     self,
     positions: torch.Tensor,

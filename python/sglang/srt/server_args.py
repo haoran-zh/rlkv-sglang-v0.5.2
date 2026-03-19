@@ -332,6 +332,9 @@ class ServerArgs:
     recent_window_size: int = 32
     adapter_load_path: Optional[str] = None
     adapter_init_value: float = 1.0
+    enable_semantic_kv: bool = False
+    semantic_kv_rank: int = 32
+    semantic_kv_load_path: Optional[str] = None
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -1908,6 +1911,23 @@ class ServerArgs:
             type=float,
             default=ServerArgs.adapter_init_value,
             help="Initial value for the adapter weights in mixed attention.",
+        )
+        parser.add_argument(
+            "--enable-semantic-kv",
+            action="store_true",
+            help="Register semantic-KV projector modules for rollout weight sync.",
+        )
+        parser.add_argument(
+            "--semantic-kv-rank",
+            type=int,
+            default=ServerArgs.semantic_kv_rank,
+            help="Low-rank dimension for semantic-KV projectors.",
+        )
+        parser.add_argument(
+            "--semantic-kv-load-path",
+            type=str,
+            default=ServerArgs.semantic_kv_load_path,
+            help="Optional checkpoint path for semantic-KV projector weights.",
         )
 
         # Optimization/debug options
