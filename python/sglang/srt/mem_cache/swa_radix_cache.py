@@ -428,6 +428,16 @@ class SWARadixCache(BasePrefixCache):
     def cache_finished_req(self, req: Req) -> None:
         """Cache request when it finishes."""
         if self.disable:
+            semantic_kv_manager = getattr(
+                self.token_to_kv_pool_allocator,
+                "semantic_kv_manager",
+                None,
+            )
+            if semantic_kv_manager is not None:
+                self.req_to_token_pool.free(req.req_pool_idx)
+                semantic_kv_manager.reset_request(req.rid)
+                return
+
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx,
                 : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
@@ -465,12 +475,24 @@ class SWARadixCache(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
-            ]
+            semantic_kv_manager = getattr(
+                self.token_to_kv_pool_allocator,
+                "semantic_kv_manager",
+                None,
+            )
+            if semantic_kv_manager is not None:
+                req.prefix_indices = semantic_kv_manager.build_prefix_placeholder(
+                    request_key=req.rid,
+                    logical_len=len(req.fill_ids),
+                    device=self.req_to_token_pool.device,
+                )
+            else:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : len(req.fill_ids)
+                ]
 
-            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-            req.prefix_indices = kv_indices
+                # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+                req.prefix_indices = kv_indices
             return
 
         token_ids = req.fill_ids

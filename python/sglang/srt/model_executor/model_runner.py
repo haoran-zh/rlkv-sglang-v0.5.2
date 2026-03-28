@@ -368,6 +368,48 @@ class ModelRunner:
             raise ValueError(
                 "enable_mixed_attention and enable_semantic_kv are mutually exclusive."
             )
+        if self.server_args.enable_semantic_kv:
+            if self.server_args.enable_hierarchical_cache:
+                raise ValueError(
+                    "Semantic-KV rollout does not support hierarchical cache."
+                )
+            if self.server_args.disaggregation_mode != "null":
+                raise ValueError(
+                    "Semantic-KV rollout does not support disaggregation."
+                )
+            if not self.spec_algorithm.is_none():
+                raise ValueError(
+                    "Semantic-KV rollout does not support speculative decoding."
+                )
+            if self.server_args.page_size != 1:
+                logger.warning(
+                    "Semantic-KV rollout requires page_size=1. Overriding page_size=%s to 1.",
+                    self.server_args.page_size,
+                )
+                self.server_args.page_size = 1
+                self.page_size = 1
+            if not self.server_args.disable_radix_cache:
+                logger.warning(
+                    "Semantic-KV rollout disables radix cache because live KV slots "
+                    "are no longer a one-to-one logical token mapping."
+                )
+                self.server_args.disable_radix_cache = True
+            explicit_backends = [
+                self.server_args.attention_backend,
+                self.server_args.prefill_attention_backend,
+                self.server_args.decode_attention_backend,
+            ]
+            if any(
+                backend is not None and backend != "torch_native"
+                for backend in explicit_backends
+            ):
+                raise ValueError(
+                    "Semantic-KV rollout currently requires the torch_native "
+                    "attention backend for both prefill and decode."
+                )
+            self.server_args.attention_backend = "torch_native"
+            self.server_args.prefill_attention_backend = "torch_native"
+            self.server_args.decode_attention_backend = "torch_native"
 
         # enable mixed_attention forward
         # add by Wenjie
@@ -452,9 +494,12 @@ class ModelRunner:
                 # Register the adapter layer as a submodule
                 module.add_module("adapter", adapter)
         elif self.server_args.enable_semantic_kv:
-            from sglang.srt.model_executor.monkey_forward import SemanticKVProjectionLayer
+            from sglang.srt.model_executor.monkey_forward import (
+                SemanticKVProjectionLayer,
+            )
 
             semantic_kv_weights = None
+            semantic_kv_config = None
             semantic_kv_load_path = self.server_args.semantic_kv_load_path
 
             if semantic_kv_load_path is not None:
@@ -468,6 +513,7 @@ class ModelRunner:
                     )
                     checkpoint = torch.load(semantic_kv_load_path, map_location="cpu")
                     semantic_kv_weights = checkpoint.get("projection_weight_dict", None)
+                    semantic_kv_config = checkpoint.get("config", None)
                     if semantic_kv_weights is None:
                         raise ValueError(
                             f"Invalid semantic-KV checkpoint: {semantic_kv_load_path}"
@@ -477,11 +523,56 @@ class ModelRunner:
                         f"Semantic-KV weights path {semantic_kv_load_path} does not exist."
                     )
 
+            if semantic_kv_config is not None:
+                checkpoint_ratio = semantic_kv_config.get("budget_ratio", None)
+                checkpoint_sink = semantic_kv_config.get("sink_window_size", None)
+                checkpoint_recent = semantic_kv_config.get("recent_window_size", None)
+                if (
+                    checkpoint_ratio is not None
+                    and checkpoint_ratio != self.server_args.semantic_kv_budget_ratio
+                ) or (
+                    checkpoint_sink is not None
+                    and checkpoint_sink != self.server_args.semantic_kv_sink_window_size
+                ) or (
+                    checkpoint_recent is not None
+                    and checkpoint_recent
+                    != self.server_args.semantic_kv_recent_window_size
+                ):
+                    logger.warning(
+                        "Semantic-KV rollout config differs from the checkpoint config. "
+                        "Rollout uses ratio=%s sink=%s recent=%s while the checkpoint "
+                        "stores ratio=%s sink=%s recent=%s.",
+                        self.server_args.semantic_kv_budget_ratio,
+                        self.server_args.semantic_kv_sink_window_size,
+                        self.server_args.semantic_kv_recent_window_size,
+                        checkpoint_ratio,
+                        checkpoint_sink,
+                        checkpoint_recent,
+                    )
+
+            model_type = self.model_config.hf_config.model_type.lower()
+            if model_type == "qwen3":
+                from sglang.srt.model_executor.monkey_forward import (
+                    monkey_qwen3_forward as _forward,
+                )
+            elif model_type in ["llama", "qwen2"]:
+                from sglang.srt.model_executor.monkey_forward import (
+                    monkey_forward as _forward,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Semantic-KV rollout is not supported for the {model_type}"
+                )
+
             for layer_id, layer in enumerate(self.model.model.layers):
                 module = layer.self_attn
+                module.forward = types.MethodType(_forward, module)
                 semantic_kv = SemanticKVProjectionLayer(
                     low_rank_dim=self.server_args.semantic_kv_rank,
                     head_dim=module.head_dim,
+                    budget_ratio=self.server_args.semantic_kv_budget_ratio,
+                    sink_window_size=self.server_args.semantic_kv_sink_window_size,
+                    recent_window_size=self.server_args.semantic_kv_recent_window_size,
                     params_dtype=self.dtype,
                 ).to(self.device)
 
@@ -503,11 +594,6 @@ class ModelRunner:
 
                 module.add_module("semantic_kv", semantic_kv)
 
-            logger.warning(
-                "Semantic-KV modules are registered for weight sync/checkpointing, "
-                "but the rollout-time compressed attention backend is still TODO."
-            )
-
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
@@ -526,6 +612,21 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
+        if self.server_args.enable_semantic_kv:
+            from sglang.srt.model_executor.monkey_forward import (
+                SemanticKVCompactionManager,
+            )
+
+            semantic_kv_manager = SemanticKVCompactionManager(
+                allocator=self.token_to_kv_pool_allocator,
+                num_layers=self.num_effective_layers,
+            )
+            self.token_to_kv_pool_allocator.semantic_kv_manager = semantic_kv_manager
+            self.req_to_token_pool.semantic_kv_manager = semantic_kv_manager
+            for layer in self.model.model.layers:
+                module = layer.self_attn
+                if hasattr(module, "semantic_kv"):
+                    module.semantic_kv.compaction_manager = semantic_kv_manager
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()

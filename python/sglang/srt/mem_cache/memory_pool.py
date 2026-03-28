@@ -76,6 +76,7 @@ class ReqToTokenPool:
             )
 
         self.free_slots = list(range(size))
+        self.semantic_kv_request_keys: Dict[int, str] = {}
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -94,12 +95,22 @@ class ReqToTokenPool:
 
     def free(self, free_index: Union[int, List[int]]):
         if isinstance(free_index, (int,)):
+            self.semantic_kv_request_keys.pop(free_index, None)
             self.free_slots.append(free_index)
         else:
+            for idx in free_index:
+                self.semantic_kv_request_keys.pop(int(idx), None)
             self.free_slots.extend(free_index)
 
     def clear(self):
         self.free_slots = list(range(self.size))
+        self.semantic_kv_request_keys = {}
+
+    def bind_request_key(self, req_pool_idx: int, request_key: str):
+        self.semantic_kv_request_keys[int(req_pool_idx)] = request_key
+
+    def resolve_request_key(self, req_pool_idx: int) -> Optional[str]:
+        return self.semantic_kv_request_keys.get(int(req_pool_idx), None)
 
 
 class MambaPool:

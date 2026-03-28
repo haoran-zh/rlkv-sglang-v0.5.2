@@ -39,6 +39,16 @@ class ChunkCache(BasePrefixCache):
         )
 
     def cache_finished_req(self, req: Req):
+        semantic_kv_manager = getattr(
+            self.token_to_kv_pool_allocator,
+            "semantic_kv_manager",
+            None,
+        )
+        if semantic_kv_manager is not None:
+            self.req_to_token_pool.free(req.req_pool_idx)
+            semantic_kv_manager.reset_request(req.rid)
+            return
+
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx,
             # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
@@ -48,6 +58,19 @@ class ChunkCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
+        semantic_kv_manager = getattr(
+            self.token_to_kv_pool_allocator,
+            "semantic_kv_manager",
+            None,
+        )
+        if semantic_kv_manager is not None:
+            req.prefix_indices = semantic_kv_manager.build_prefix_placeholder(
+                request_key=req.rid,
+                logical_len=len(req.fill_ids),
+                device=self.req_to_token_pool.device,
+            )
+            return
+
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]

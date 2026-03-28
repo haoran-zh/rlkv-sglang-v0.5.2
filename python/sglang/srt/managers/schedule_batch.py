@@ -1187,6 +1187,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
+            if hasattr(self.req_to_token_pool, "bind_request_key"):
+                self.req_to_token_pool.bind_request_key(req.req_pool_idx, req.rid)
             assert seq_len - pre_len == req.extend_input_len
 
             if pre_len > 0:
@@ -1407,6 +1409,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
+        semantic_kv_manager = getattr(
+            self.token_to_kv_pool_allocator,
+            "semantic_kv_manager",
+            None,
+        )
 
         # TODO(lsyin): improve retraction policy for radix cache
         # For spec decoding, filter_batch API can only filter
@@ -1456,7 +1463,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
 
-            if isinstance(self.tree_cache, ChunkCache):
+            if semantic_kv_manager is not None:
+                semantic_kv_manager.reset_request(req.rid)
+                self.req_to_token_pool.free(req.req_pool_idx)
+            elif isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
                 token_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, : seq_lens_cpu[idx]
@@ -1522,6 +1532,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+
+        if hasattr(self.req_to_token_pool, "bind_request_key"):
+            for req in self.reqs:
+                self.req_to_token_pool.bind_request_key(req.req_pool_idx, req.rid)
 
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             # if spec decoding is used, the decode batch is prepared inside

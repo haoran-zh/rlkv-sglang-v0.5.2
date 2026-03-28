@@ -334,6 +334,9 @@ class ServerArgs:
     adapter_init_value: float = 1.0
     enable_semantic_kv: bool = False
     semantic_kv_rank: int = 32
+    semantic_kv_budget_ratio: float = 0.5
+    semantic_kv_sink_window_size: int = 16
+    semantic_kv_recent_window_size: int = 64
     semantic_kv_load_path: Optional[str] = None
 
     # Optimization/debug options
@@ -633,6 +636,36 @@ class ServerArgs:
         if self.page_size is None:
             self.page_size = 1
 
+        if self.enable_semantic_kv:
+            if self.page_size != 1:
+                logger.warning(
+                    "Semantic-KV rollout requires page_size=1. Changing page_size from %s to 1.",
+                    self.page_size,
+                )
+                self.page_size = 1
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "Semantic-KV rollout disables radix cache because semantic "
+                    "compression breaks the logical-token to KV-slot identity."
+                )
+                self.disable_radix_cache = True
+            if not self.disable_overlap_schedule:
+                logger.warning(
+                    "Overlap scheduler is disabled for semantic-KV rollout."
+                )
+                self.disable_overlap_schedule = True
+            if not self.disable_cuda_graph:
+                logger.warning("Cuda graph is disabled for semantic-KV rollout.")
+                self.disable_cuda_graph = True
+            if self.enable_hierarchical_cache:
+                raise ValueError(
+                    "Semantic-KV rollout does not support hierarchical cache."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "Semantic-KV rollout does not support disaggregation."
+                )
+
         # AMD-specific Triton attention KV splits default number
         if is_hip():
             self.triton_attention_num_kv_splits = 16
@@ -729,6 +762,11 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
+
+        if self.enable_semantic_kv and self.speculative_algorithm:
+            raise ValueError(
+                "Semantic-KV rollout does not support speculative decoding."
+            )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE":
@@ -1922,6 +1960,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.semantic_kv_rank,
             help="Low-rank dimension for semantic-KV projectors.",
+        )
+        parser.add_argument(
+            "--semantic-kv-budget-ratio",
+            type=float,
+            default=ServerArgs.semantic_kv_budget_ratio,
+            help="Budget ratio used by semantic-KV cache compression.",
+        )
+        parser.add_argument(
+            "--semantic-kv-sink-window-size",
+            type=int,
+            default=ServerArgs.semantic_kv_sink_window_size,
+            help="Number of sink tokens always retained by semantic-KV.",
+        )
+        parser.add_argument(
+            "--semantic-kv-recent-window-size",
+            type=int,
+            default=ServerArgs.semantic_kv_recent_window_size,
+            help="Number of recent tokens always retained by semantic-KV.",
         )
         parser.add_argument(
             "--semantic-kv-load-path",
