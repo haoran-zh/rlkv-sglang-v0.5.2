@@ -364,9 +364,18 @@ class ModelRunner:
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
 
-        if self.server_args.enable_mixed_attention and self.server_args.enable_semantic_kv:
+        enabled_sparse_rollout_modes = sum(
+            int(flag)
+            for flag in (
+                self.server_args.enable_mixed_attention,
+                self.server_args.enable_semantic_kv,
+                self.server_args.enable_learned_loki,
+            )
+        )
+        if enabled_sparse_rollout_modes > 1:
             raise ValueError(
-                "enable_mixed_attention and enable_semantic_kv are mutually exclusive."
+                "enable_mixed_attention, enable_semantic_kv, and enable_learned_loki "
+                "are mutually exclusive."
             )
         if self.server_args.enable_semantic_kv:
             if self.server_args.enable_hierarchical_cache:
@@ -405,6 +414,35 @@ class ModelRunner:
             ):
                 raise ValueError(
                     "Semantic-KV rollout currently requires the torch_native "
+                    "attention backend for both prefill and decode."
+                )
+            self.server_args.attention_backend = "torch_native"
+            self.server_args.prefill_attention_backend = "torch_native"
+            self.server_args.decode_attention_backend = "torch_native"
+        if self.server_args.enable_learned_loki:
+            if self.server_args.enable_hierarchical_cache:
+                raise ValueError(
+                    "Learned-Loki rollout does not support hierarchical cache."
+                )
+            if self.server_args.disaggregation_mode != "null":
+                raise ValueError(
+                    "Learned-Loki rollout does not support disaggregation."
+                )
+            if not self.spec_algorithm.is_none():
+                raise ValueError(
+                    "Learned-Loki rollout does not support speculative decoding."
+                )
+            explicit_backends = [
+                self.server_args.attention_backend,
+                self.server_args.prefill_attention_backend,
+                self.server_args.decode_attention_backend,
+            ]
+            if any(
+                backend is not None and backend != "torch_native"
+                for backend in explicit_backends
+            ):
+                raise ValueError(
+                    "Learned-Loki rollout currently requires the torch_native "
                     "attention backend for both prefill and decode."
                 )
             self.server_args.attention_backend = "torch_native"
@@ -593,6 +631,140 @@ class ModelRunner:
                         semantic_kv.weight.copy_(full_weight.to(self.device))
 
                 module.add_module("semantic_kv", semantic_kv)
+        elif self.server_args.enable_learned_loki:
+            from sglang.srt.model_executor.monkey_forward import (
+                LearnedLokiProjectionLayer,
+            )
+
+            learned_loki_weights = None
+            learned_loki_thresholds = None
+            learned_loki_config = None
+            learned_loki_load_path = self.server_args.learned_loki_load_path
+
+            if learned_loki_load_path is not None:
+                if os.path.isdir(learned_loki_load_path):
+                    learned_loki_load_path = os.path.join(
+                        learned_loki_load_path, "learned_loki.pt"
+                    )
+                if os.path.exists(learned_loki_load_path):
+                    logger.info(
+                        "Loading Learned-Loki weights from %s", learned_loki_load_path
+                    )
+                    checkpoint = torch.load(learned_loki_load_path, map_location="cpu")
+                    learned_loki_weights = checkpoint.get("projection_weight_dict", None)
+                    learned_loki_thresholds = checkpoint.get("threshold_dict", None)
+                    learned_loki_config = checkpoint.get("config", None)
+                    if (
+                        learned_loki_weights is None
+                        or learned_loki_thresholds is None
+                    ):
+                        raise ValueError(
+                            f"Invalid Learned-Loki checkpoint: {learned_loki_load_path}"
+                        )
+                else:
+                    raise ValueError(
+                        f"Learned-Loki weights path {learned_loki_load_path} does not exist."
+                    )
+
+            if learned_loki_config is not None:
+                checkpoint_ratio = learned_loki_config.get("budget_ratio", None)
+                checkpoint_sink = learned_loki_config.get("sink_window_size", None)
+                checkpoint_recent = learned_loki_config.get("recent_window_size", None)
+                checkpoint_temperature = learned_loki_config.get(
+                    "gate_temperature", None
+                )
+                if (
+                    checkpoint_ratio is not None
+                    and checkpoint_ratio != self.server_args.learned_loki_budget_ratio
+                ) or (
+                    checkpoint_sink is not None
+                    and checkpoint_sink
+                    != self.server_args.learned_loki_sink_window_size
+                ) or (
+                    checkpoint_recent is not None
+                    and checkpoint_recent
+                    != self.server_args.learned_loki_recent_window_size
+                ) or (
+                    checkpoint_temperature is not None
+                    and checkpoint_temperature
+                    != self.server_args.learned_loki_gate_temperature
+                ):
+                    logger.warning(
+                        "Learned-Loki rollout config differs from the checkpoint config. "
+                        "Rollout uses ratio=%s sink=%s recent=%s gate_temp=%s while "
+                        "the checkpoint stores ratio=%s sink=%s recent=%s gate_temp=%s.",
+                        self.server_args.learned_loki_budget_ratio,
+                        self.server_args.learned_loki_sink_window_size,
+                        self.server_args.learned_loki_recent_window_size,
+                        self.server_args.learned_loki_gate_temperature,
+                        checkpoint_ratio,
+                        checkpoint_sink,
+                        checkpoint_recent,
+                        checkpoint_temperature,
+                    )
+
+            model_type = self.model_config.hf_config.model_type.lower()
+            if model_type == "qwen3":
+                from sglang.srt.model_executor.monkey_forward import (
+                    monkey_qwen3_forward as _forward,
+                )
+            elif model_type in ["llama", "qwen2"]:
+                from sglang.srt.model_executor.monkey_forward import (
+                    monkey_forward as _forward,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Learned-Loki rollout is not supported for the {model_type}"
+                )
+
+            for layer_id, layer in enumerate(self.model.model.layers):
+                module = layer.self_attn
+                module.forward = types.MethodType(_forward, module)
+                learned_loki = LearnedLokiProjectionLayer(
+                    low_rank_dim=self.server_args.learned_loki_rank,
+                    head_dim=module.head_dim,
+                    budget_ratio=self.server_args.learned_loki_budget_ratio,
+                    sink_window_size=self.server_args.learned_loki_sink_window_size,
+                    recent_window_size=self.server_args.learned_loki_recent_window_size,
+                    gate_temperature=self.server_args.learned_loki_gate_temperature,
+                    threshold_init=self.server_args.learned_loki_threshold_init,
+                    params_dtype=self.dtype,
+                ).to(self.device)
+
+                if learned_loki_weights is not None:
+                    layer_key = (
+                        layer_id if layer_id in learned_loki_weights else str(layer_id)
+                    )
+                    if layer_key not in learned_loki_weights:
+                        raise ValueError(
+                            f"Learned-Loki weights for layer {layer_id} not found in "
+                            f"the provided path: {learned_loki_load_path}"
+                        )
+                    full_weight = learned_loki_weights[layer_key]
+                    if full_weight.shape != learned_loki.weight.shape:
+                        raise ValueError(
+                            f"Learned-Loki weight shape mismatch for layer {layer_id}: "
+                            f"expected {learned_loki.weight.shape}, got {full_weight.shape}"
+                        )
+                    with torch.no_grad():
+                        learned_loki.weight.copy_(full_weight.to(self.device))
+
+                if learned_loki_thresholds is not None:
+                    layer_key = (
+                        layer_id
+                        if layer_id in learned_loki_thresholds
+                        else str(layer_id)
+                    )
+                    if layer_key not in learned_loki_thresholds:
+                        raise ValueError(
+                            f"Learned-Loki threshold for layer {layer_id} not found in "
+                            f"the provided path: {learned_loki_load_path}"
+                        )
+                    threshold = learned_loki_thresholds[layer_key]
+                    with torch.no_grad():
+                        learned_loki.threshold.copy_(threshold.to(self.device))
+
+                module.add_module("learned_loki", learned_loki)
 
         # Init lora
         if server_args.enable_lora:

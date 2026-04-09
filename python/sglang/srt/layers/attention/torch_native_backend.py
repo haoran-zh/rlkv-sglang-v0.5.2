@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import torch
@@ -12,7 +13,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.monkey_forward import SemanticKVProjectionLayer
+    from sglang.srt.model_executor.monkey_forward import (
+        LearnedLokiProjectionLayer,
+        SemanticKVProjectionLayer,
+    )
 
 
 def _repeat_kv_tokens(
@@ -46,6 +50,87 @@ def _semantic_attention_step(
         expanded_values,
     )
     return output.to(query_state.dtype), attn_probs
+
+
+def _split_windows(
+    total_tokens: int,
+    sink_window_size: int,
+    recent_window_size: int,
+) -> tuple[int, int]:
+    keep_sink = min(sink_window_size, total_tokens)
+    keep_recent = min(recent_window_size, max(total_tokens - keep_sink, 0))
+    middle_end = total_tokens - keep_recent
+    return keep_sink, middle_end
+
+
+def _compute_learned_loki_gates(
+    query_state: torch.Tensor,
+    key_states: torch.Tensor,
+    learned_loki: "LearnedLokiProjectionLayer",
+    num_key_value_groups: int,
+) -> torch.Tensor:
+    total_tokens = key_states.shape[0]
+    gates = key_states.new_ones((total_tokens,), dtype=torch.float32)
+    keep_sink, middle_end = _split_windows(
+        total_tokens,
+        sink_window_size=learned_loki.sink_window_size,
+        recent_window_size=learned_loki.recent_window_size,
+    )
+    if middle_end <= keep_sink:
+        return gates
+
+    projected_query = torch.nn.functional.linear(
+        query_state.float(),
+        learned_loki.weight.float(),
+    )
+    projected_keys = learned_loki.project_token_keys(key_states)
+    expanded_projected_keys = _repeat_kv_tokens(
+        projected_keys,
+        num_key_value_groups,
+    ).transpose(0, 1)
+    approx_scores = (
+        torch.einsum(
+            "hr,hsr->hs",
+            projected_query.float(),
+            expanded_projected_keys.float(),
+        )
+        / math.sqrt(learned_loki.low_rank_dim)
+    ).mean(dim=0)
+    gates[keep_sink:middle_end] = torch.sigmoid(
+        (
+            approx_scores[keep_sink:middle_end]
+            - learned_loki.threshold.float()
+        )
+        / max(learned_loki.gate_temperature, 1e-6)
+    )
+    return gates
+
+
+def _learned_loki_attention_step(
+    query_state: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    gates: torch.Tensor,
+    num_key_value_groups: int,
+    scaling: float,
+) -> torch.Tensor:
+    expanded_keys = _repeat_kv_tokens(key_states, num_key_value_groups).transpose(0, 1)
+    expanded_values = _repeat_kv_tokens(value_states, num_key_value_groups).transpose(
+        0,
+        1,
+    )
+    attn_logits = (
+        torch.einsum("hd,hsd->hs", query_state.float(), expanded_keys.float())
+        * scaling
+    )
+    attn_logits = attn_logits + torch.log(gates.clamp_min(1e-6)).unsqueeze(0)
+    attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32)
+    output = torch.einsum(
+        "hs,hsd->hd",
+        attn_probs.to(expanded_values.dtype),
+        expanded_values,
+    )
+    return output.to(query_state.dtype)
 
 
 def _hard_greedy_select(
@@ -513,6 +598,93 @@ class TorchNativeAttnBackend(AttentionBackend):
             )
         return output
 
+    def _run_learned_loki_forward_extend(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token_pool,
+        req_pool_indices: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        layer: "RadixAttention",
+        learned_loki: "LearnedLokiProjectionLayer",
+    ):
+        num_key_value_groups = layer.tp_q_head_num // layer.tp_k_head_num
+        start_q = 0
+        for seq_idx in range(req_pool_indices.shape[0]):
+            req_pool_idx = int(req_pool_indices[seq_idx].item())
+            prefix_len = int(extend_prefix_lens[seq_idx].item())
+            extend_len = int(extend_seq_lens[seq_idx].item())
+            end_q = start_q + extend_len
+            if extend_len <= 0:
+                start_q = end_q
+                continue
+
+            full_slots = req_to_token_pool.req_to_token[
+                req_pool_idx, : prefix_len + extend_len
+            ].long()
+            full_keys = k_cache[full_slots]
+            full_values = v_cache[full_slots]
+            per_req_query = query[start_q:end_q]
+
+            for token_offset in range(extend_len):
+                live_len = prefix_len + token_offset + 1
+                live_keys = full_keys[:live_len]
+                live_values = full_values[:live_len]
+                gates = _compute_learned_loki_gates(
+                    query_state=per_req_query[token_offset],
+                    key_states=live_keys,
+                    learned_loki=learned_loki,
+                    num_key_value_groups=num_key_value_groups,
+                )
+                output[start_q + token_offset] = _learned_loki_attention_step(
+                    query_state=per_req_query[token_offset],
+                    key_states=live_keys,
+                    value_states=live_values,
+                    gates=gates,
+                    num_key_value_groups=num_key_value_groups,
+                    scaling=layer.scaling,
+                )
+            start_q = end_q
+        return output
+
+    def _run_learned_loki_forward_decode(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token_pool,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        layer: "RadixAttention",
+        learned_loki: "LearnedLokiProjectionLayer",
+    ):
+        num_key_value_groups = layer.tp_q_head_num // layer.tp_k_head_num
+        for seq_idx in range(req_pool_indices.shape[0]):
+            req_pool_idx = int(req_pool_indices[seq_idx].item())
+            seq_len = int(seq_lens[seq_idx].item())
+            live_slots = req_to_token_pool.req_to_token[req_pool_idx, :seq_len].long()
+            live_keys = k_cache[live_slots]
+            live_values = v_cache[live_slots]
+            gates = _compute_learned_loki_gates(
+                query_state=query[seq_idx],
+                key_states=live_keys,
+                learned_loki=learned_loki,
+                num_key_value_groups=num_key_value_groups,
+            )
+            output[seq_idx] = _learned_loki_attention_step(
+                query_state=query[seq_idx],
+                key_states=live_keys,
+                value_states=live_values,
+                gates=gates,
+                num_key_value_groups=num_key_value_groups,
+                scaling=layer.scaling,
+            )
+        return output
+
     def forward_extend(
         self,
         q,
@@ -522,6 +694,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         semantic_kv: Optional["SemanticKVProjectionLayer"] = None,
+        learned_loki: Optional["LearnedLokiProjectionLayer"] = None,
         **kwargs,
     ):
         del kwargs
@@ -560,6 +733,20 @@ class TorchNativeAttnBackend(AttentionBackend):
                 semantic_kv,
             )
             return o
+        if learned_loki is not None:
+            self._run_learned_loki_forward_extend(
+                q_,
+                o_,
+                k_cache,
+                v_cache,
+                forward_batch.req_to_token_pool,
+                forward_batch.req_pool_indices,
+                forward_batch.extend_prefix_lens,
+                forward_batch.extend_seq_lens,
+                layer,
+                learned_loki,
+            )
+            return o
 
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
@@ -590,6 +777,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         semantic_kv: Optional["SemanticKVProjectionLayer"] = None,
+        learned_loki: Optional["LearnedLokiProjectionLayer"] = None,
         **kwargs,
     ):
         del kwargs
@@ -627,6 +815,19 @@ class TorchNativeAttnBackend(AttentionBackend):
                 cache_loc,
                 layer,
                 semantic_kv,
+            )
+            return o
+        if learned_loki is not None:
+            self._run_learned_loki_forward_decode(
+                q_,
+                o_,
+                k_cache,
+                v_cache,
+                forward_batch.req_to_token_pool,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                layer,
+                learned_loki,
             )
             return o
 

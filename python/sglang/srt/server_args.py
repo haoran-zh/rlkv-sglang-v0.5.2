@@ -338,6 +338,14 @@ class ServerArgs:
     semantic_kv_sink_window_size: int = 16
     semantic_kv_recent_window_size: int = 64
     semantic_kv_load_path: Optional[str] = None
+    enable_learned_loki: bool = False
+    learned_loki_rank: int = 32
+    learned_loki_budget_ratio: float = 0.5
+    learned_loki_sink_window_size: int = 16
+    learned_loki_recent_window_size: int = 64
+    learned_loki_gate_temperature: float = 1.0
+    learned_loki_threshold_init: float = 0.0
+    learned_loki_load_path: Optional[str] = None
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -665,6 +673,29 @@ class ServerArgs:
                 raise ValueError(
                     "Semantic-KV rollout does not support disaggregation."
                 )
+        if self.enable_learned_loki:
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "Learned-Loki rollout disables radix cache to avoid stale prefix "
+                    "reuse across weight updates."
+                )
+                self.disable_radix_cache = True
+            if not self.disable_overlap_schedule:
+                logger.warning(
+                    "Overlap scheduler is disabled for Learned-Loki rollout."
+                )
+                self.disable_overlap_schedule = True
+            if not self.disable_cuda_graph:
+                logger.warning("Cuda graph is disabled for Learned-Loki rollout.")
+                self.disable_cuda_graph = True
+            if self.enable_hierarchical_cache:
+                raise ValueError(
+                    "Learned-Loki rollout does not support hierarchical cache."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "Learned-Loki rollout does not support disaggregation."
+                )
 
         # AMD-specific Triton attention KV splits default number
         if is_hip():
@@ -766,6 +797,10 @@ class ServerArgs:
         if self.enable_semantic_kv and self.speculative_algorithm:
             raise ValueError(
                 "Semantic-KV rollout does not support speculative decoding."
+            )
+        if self.enable_learned_loki and self.speculative_algorithm:
+            raise ValueError(
+                "Learned-Loki rollout does not support speculative decoding."
             )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
@@ -1984,6 +2019,53 @@ class ServerArgs:
             type=str,
             default=ServerArgs.semantic_kv_load_path,
             help="Optional checkpoint path for semantic-KV projector weights.",
+        )
+        parser.add_argument(
+            "--enable-learned-loki",
+            action="store_true",
+            help="Register Learned-Loki projection modules for rollout weight sync.",
+        )
+        parser.add_argument(
+            "--learned-loki-rank",
+            type=int,
+            default=ServerArgs.learned_loki_rank,
+            help="Low-rank dimension for Learned-Loki projectors.",
+        )
+        parser.add_argument(
+            "--learned-loki-budget-ratio",
+            type=float,
+            default=ServerArgs.learned_loki_budget_ratio,
+            help="Inference-time middle-token budget ratio used by Learned-Loki.",
+        )
+        parser.add_argument(
+            "--learned-loki-sink-window-size",
+            type=int,
+            default=ServerArgs.learned_loki_sink_window_size,
+            help="Number of sink tokens always retained by Learned-Loki.",
+        )
+        parser.add_argument(
+            "--learned-loki-recent-window-size",
+            type=int,
+            default=ServerArgs.learned_loki_recent_window_size,
+            help="Number of recent tokens always retained by Learned-Loki.",
+        )
+        parser.add_argument(
+            "--learned-loki-gate-temperature",
+            type=float,
+            default=ServerArgs.learned_loki_gate_temperature,
+            help="Soft gate temperature used during Learned-Loki rollout.",
+        )
+        parser.add_argument(
+            "--learned-loki-threshold-init",
+            type=float,
+            default=ServerArgs.learned_loki_threshold_init,
+            help="Initial threshold used when no Learned-Loki checkpoint is provided.",
+        )
+        parser.add_argument(
+            "--learned-loki-load-path",
+            type=str,
+            default=ServerArgs.learned_loki_load_path,
+            help="Optional checkpoint path for Learned-Loki projector weights.",
         )
 
         # Optimization/debug options

@@ -13,6 +13,17 @@ from sglang.srt.distributed import (
 from sglang.srt.utils import set_weight_attrs
 
 
+def _init_orthogonal_param(param: Parameter):
+    with torch.no_grad():
+        init_weight = torch.empty(
+            param.shape,
+            device=param.device,
+            dtype=torch.float32,
+        )
+        nn.init.orthogonal_(init_weight)
+        param.copy_(init_weight.to(dtype=param.dtype))
+
+
 class HeadAdapterLayer(nn.Module):
     """Adapter layer with tensor parallelism support.
 
@@ -278,7 +289,7 @@ class SemanticKVProjectionLayer(nn.Module):
         self.sink_window_size = sink_window_size
         self.recent_window_size = recent_window_size
         self.weight = Parameter(torch.empty(low_rank_dim, head_dim, dtype=params_dtype))
-        nn.init.orthogonal_(self.weight)
+        _init_orthogonal_param(self.weight)
         self.request_states: Dict[str, Dict[str, Union[torch.Tensor, int]]] = {}
         self.compaction_manager: Optional[SemanticKVCompactionManager] = None
 
@@ -316,6 +327,65 @@ class SemanticKVProjectionLayer(nn.Module):
         )
 
 
+class LearnedLokiProjectionLayer(nn.Module):
+    """Replicated low-rank scorer used for Learned-Loki rollout."""
+
+    def __init__(
+        self,
+        low_rank_dim: int,
+        head_dim: int,
+        budget_ratio: float,
+        sink_window_size: int,
+        recent_window_size: int,
+        gate_temperature: float,
+        threshold_init: float,
+        params_dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__()
+        self.low_rank_dim = low_rank_dim
+        self.head_dim = head_dim
+        self.budget_ratio = budget_ratio
+        self.sink_window_size = sink_window_size
+        self.recent_window_size = recent_window_size
+        self.weight = Parameter(torch.empty(low_rank_dim, head_dim, dtype=params_dtype))
+        self.threshold = Parameter(
+            torch.full((), threshold_init, dtype=params_dtype or torch.float32)
+        )
+        self.gate_temperature_param = Parameter(
+            torch.full((), gate_temperature, dtype=params_dtype or torch.float32),
+            requires_grad=False,
+        )
+        _init_orthogonal_param(self.weight)
+
+    def cache_budget(self, seq_len: int) -> int:
+        protected = self.sink_window_size + self.recent_window_size
+        middle_tokens = max(seq_len - protected, 0)
+        middle_budget = min(int(middle_tokens * self.budget_ratio), middle_tokens)
+        return min(protected + middle_budget, seq_len)
+
+    def project_token_keys(self, key_states: torch.Tensor) -> torch.Tensor:
+        token_keys = key_states.float()
+        return F.linear(token_keys, self.weight.float())
+
+    @property
+    def gate_temperature(self) -> float:
+        return float(self.gate_temperature_param.detach().item())
+
+    @gate_temperature.setter
+    def gate_temperature(self, value: float):
+        with torch.no_grad():
+            self.gate_temperature_param.fill_(float(value))
+
+    def extra_repr(self) -> str:
+        return (
+            f"low_rank_dim={self.low_rank_dim}, head_dim={self.head_dim}, "
+            f"budget_ratio={self.budget_ratio}, "
+            f"sink_window_size={self.sink_window_size}, "
+            f"recent_window_size={self.recent_window_size}, "
+            f"gate_temperature={self.gate_temperature}"
+        )
+
+
 def monkey_forward(
     self,
     positions: torch.Tensor,
@@ -330,6 +400,8 @@ def monkey_forward(
         attn_kwargs["adapter"] = self.adapter
     if hasattr(self, "semantic_kv"):
         attn_kwargs["semantic_kv"] = self.semantic_kv
+    if hasattr(self, "learned_loki"):
+        attn_kwargs["learned_loki"] = self.learned_loki
     attn_output = self.attn(
         q,
         k,
@@ -356,6 +428,8 @@ def monkey_qwen3_forward(
         attn_kwargs["adapter"] = self.adapter
     if hasattr(self, "semantic_kv"):
         attn_kwargs["semantic_kv"] = self.semantic_kv
+    if hasattr(self, "learned_loki"):
+        attn_kwargs["learned_loki"] = self.learned_loki
     attn_output = self.attn(
         q,
         k,

@@ -44,12 +44,24 @@ from sglang.srt.utils import is_cuda, is_hip
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda:
-    from sgl_kernel import (
-        awq_dequantize,
-        awq_marlin_moe_repack,
-        awq_marlin_repack,
-        fused_marlin_moe,
-    )
+    try:
+        from sgl_kernel import (
+            awq_dequantize,
+            awq_marlin_moe_repack,
+            awq_marlin_repack,
+            fused_marlin_moe,
+        )
+    except ImportError:
+        from sgl_kernel import (
+            awq_dequantize,
+            awq_marlin_moe_repack,
+            awq_marlin_repack,
+        )
+
+        fused_marlin_moe = None
+        warnings.warn(
+            "sgl-kernel does not provide fused_marlin_moe; AWQ Marlin MoE kernels will be unavailable."
+        )
 
 
 elif _is_hip:
@@ -763,6 +775,11 @@ class AWQMoEMethod(FusedMoEMethodBase):
         x = x.half()
 
         topk_weights, topk_ids, router_logits = topk_output
+
+        if fused_marlin_moe is None:
+            raise RuntimeError(
+                "AWQ Marlin MoE requires fused_marlin_moe from sgl-kernel."
+            )
 
         output = fused_marlin_moe(
             x,

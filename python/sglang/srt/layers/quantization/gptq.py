@@ -55,7 +55,20 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_marlin_moe, gptq_gemm, gptq_marlin_repack, gptq_shuffle
+    try:
+        from sgl_kernel import (
+            fused_marlin_moe,
+            gptq_gemm,
+            gptq_marlin_repack,
+            gptq_shuffle,
+        )
+    except ImportError:
+        from sgl_kernel import gptq_gemm, gptq_marlin_repack, gptq_shuffle
+
+        fused_marlin_moe = None
+        logging.getLogger(__name__).warning(
+            "sgl-kernel does not provide fused_marlin_moe; GPTQ Marlin MoE kernels will be unavailable."
+        )
 
 
 logger = logging.getLogger(__name__)
@@ -1077,6 +1090,11 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         x = x.half()
 
         topk_weights, topk_ids, router_logits = topk_output
+
+        if fused_marlin_moe is None:
+            raise RuntimeError(
+                "GPTQ Marlin MoE requires fused_marlin_moe from sgl-kernel."
+            )
 
         output = fused_marlin_moe(
             x,
