@@ -760,9 +760,20 @@ class ModelRunner:
                             f"Learned-Loki threshold for layer {layer_id} not found in "
                             f"the provided path: {learned_loki_load_path}"
                         )
-                    threshold = learned_loki_thresholds[layer_key]
+                    threshold = torch.as_tensor(
+                        learned_loki_thresholds[layer_key],
+                        device=self.device,
+                        dtype=learned_loki.threshold.dtype,
+                    )
+                    if threshold.numel() == learned_loki.threshold.numel():
+                        threshold = threshold.reshape_as(learned_loki.threshold)
+                    elif threshold.numel() != 1 or learned_loki.threshold.numel() != 1:
+                        raise ValueError(
+                            f"Learned-Loki threshold shape mismatch for layer {layer_id}: "
+                            f"expected {tuple(learned_loki.threshold.shape)}, got {tuple(threshold.shape)}"
+                        )
                     with torch.no_grad():
-                        learned_loki.threshold.copy_(threshold.to(self.device))
+                        learned_loki.threshold.copy_(threshold)
 
                 module.add_module("learned_loki", learned_loki)
 

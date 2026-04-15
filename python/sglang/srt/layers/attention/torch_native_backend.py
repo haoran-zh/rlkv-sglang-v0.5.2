@@ -79,6 +79,13 @@ def _compute_learned_loki_gates(
     if middle_end <= keep_sink:
         return gates
 
+    cache_budget = learned_loki.cache_budget(total_tokens)
+    keep_recent = total_tokens - middle_end
+    num_select = max(cache_budget - keep_sink - keep_recent, 0)
+    gates[keep_sink:middle_end] = 0.0
+    if num_select <= 0:
+        return gates
+
     projected_query = torch.nn.functional.linear(
         query_state.float(),
         learned_loki.weight.float(),
@@ -96,13 +103,12 @@ def _compute_learned_loki_gates(
         )
         / math.sqrt(learned_loki.low_rank_dim)
     ).mean(dim=0)
-    gates[keep_sink:middle_end] = torch.sigmoid(
-        (
-            approx_scores[keep_sink:middle_end]
-            - learned_loki.threshold.float()
-        )
-        / max(learned_loki.gate_temperature, 1e-6)
-    )
+
+    middle_scores = approx_scores[keep_sink:middle_end]
+    topk = min(num_select, middle_scores.numel())
+    if topk > 0:
+        selected = torch.topk(middle_scores, k=topk, sorted=False).indices + keep_sink
+        gates[selected] = 1.0
     return gates
 
 
